@@ -1,321 +1,68 @@
 """
-TICKET-BOT
-==========
-Zuständig für das Bestell-System. Postet Buttons in #bestellen -> Klick
-öffnet ein privates Ticket, in dem Big/Klein Fam ausgewählt wird und der
-passende Preis angezeigt wird. Danach kann das Ticket geschlossen werden
-(Transcript wird in #ticket-logs gespeichert).
+VOLT TICKETS
+============
+"Tickets. Orders. Done right." - VOLT Discord Solutions
 
-Einrichtung:
-1. pip install -r requirements.txt
-2. .env.example -> .env kopieren und ausfüllen
-3. python bot.py
-4. Im Kanal #bestellen einmalig /setup-tickets ausführen
+Baut das Bestell-Panel mit zweistufigem Dropdown auf:
+
+    1. Kategorie wählen  -> FiveM Bots / Discord Server / Discord Custom Bots
+    2. Produkt wählen     -> abhängig von Kategorie, Preise aus products.py
+
+Danach wird automatisch ein privates Ticket-Kanal erstellt.
+
+WICHTIGER FIX gegenüber der alten Version:
+-------------------------------------------
+Der alte Bot hat beim Status-Wechsel (offen -> in Bearbeitung -> geschlossen)
+`channel.edit(category=..., sync_permissions=True)` verwendet. `sync_permissions`
+übernimmt IMMER die Standard-Berechtigungen der Ziel-Kategorie und überschreibt
+dabei die eigens gesetzten Overwrites (privat: nur Ersteller + Staff) mit den
+(oft offenen) Kategorie-Defaults - dadurch konnten plötzlich alle Mitglieder
+das Ticket sehen.
+
+Diese Version nutzt IMMER explizite `overwrites=` beim Erstellen UND bei jedem
+Status-Wechsel (set_ticket_status). Es wird nirgends `sync_permissions=True`
+verwendet. Die Sichtbarkeit ist dadurch bei jedem Schritt garantiert:
+    @everyone         -> kein Zugriff
+    Ticket-Ersteller   -> sehen + schreiben (read_message_history immer erlaubt)
+    Staff-Rollen       -> sehen + schreiben + verwalten
 """
 
 import os
 import logging
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from products import PRODUCTS, HOSTING, TERMS
+from products import CATEGORIES, format_price, TERMS
+import branding
+from branding import VOLT_RED
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("ticket-bot")
+log = logging.getLogger("volt-tickets")
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("TICKET_DISCORD_TOKEN") or os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
-SUPPORT_ROLE_NAME = os.getenv("SUPPORT_ROLE_NAME", "Support")
+
+STAFF_ROLE_NAMES = [n.strip() for n in os.getenv("STAFF_ROLE_NAMES", "Admin,Moderator,Supporter").split(",") if n.strip()]
+TICKETS_OPEN_CATEGORY = os.getenv("TICKETS_OPEN_CATEGORY", "🎫 TICKETS")
+TICKETS_CLOSED_CATEGORY = os.getenv("TICKETS_CLOSED_CATEGORY", "🗄️ TICKET-ARCHIV")
+TICKET_LOG_CHANNEL = os.getenv("TICKET_LOG_CHANNEL", "ticket-logs")
 
 intents = discord.Intents.default()
 intents.members = True
 
-bot = commands.Bot(command_prefix="!ticket-", intents=intents)
 
-
-def is_admin():
-    return app_commands.checks.has_permissions(administrator=True)
-
-
-async def get_or_create_category(guild: discord.Guild, name: str) -> discord.CategoryChannel:
-    cat = discord.utils.get(guild.categories, name=name)
-    return cat or await guild.create_category(name)
-
-
-async def get_or_create_channel(guild: discord.Guild, name: str, category=None, overwrites=None) -> discord.TextChannel:
-    ch = discord.utils.get(guild.text_channels, name=name)
-    if ch is None:
-        ch = await guild.create_text_channel(name, category=category, overwrites=overwrites or {})
-    return ch
-
-
-def product_embed(key: str) -> discord.Embed:
-    p = PRODUCTS[key]
-    embed = discord.Embed(
-        title=f"{p['emoji']} {p['name']}",
-        color=discord.Color.gold(),
-    )
-    embed.add_field(name="Big Fam", value=f"{p['big']}€", inline=True)
-    embed.add_field(name="Klein Fam", value=f"{p['klein']}€", inline=True)
-    if key == "komplett":
-        embed.add_field(
-            name="+ Hosting / Monat",
-            value=f"Big Fam: {HOSTING['big']}€ | Klein Fam: {HOSTING['klein']}€",
-            inline=False,
-        )
-    embed.add_field(name="Konditionen", value=TERMS, inline=False)
-    embed.set_footer(text="Wähle unten deine Fam-Größe, um die Bestellung zu bestätigen.")
-    return embed
-
-
-class FamSelect(discord.ui.Select):
-    def __init__(self, product_key: str):
-        self.product_key = product_key
-        options = [
-            discord.SelectOption(label="Big Fam", value="big", emoji="🏰"),
-            discord.SelectOption(label="Klein Fam", value="klein", emoji="🏠"),
-        ]
-        super().__init__(placeholder="Fam-Größe wählen...", options=options, custom_id=f"fam_select:{product_key}")
-
-    async def callback(self, interaction: discord.Interaction):
-        p = PRODUCTS[self.product_key]
-        size = self.values[0]
-        price = p[size]
-        label = "Big Fam" if size == "big" else "Klein Fam"
-
-        embed = discord.Embed(
-            title="🧾 Bestellbestätigung",
-            description=f"**{p['emoji']} {p['name']}**\nFam-Größe: **{label}**\nPreis: **{price}€**",
-            color=discord.Color.green(),
-        )
-        if self.product_key == "komplett":
-            embed.add_field(name="+ Hosting / Monat", value=f"{HOSTING[size]}€", inline=False)
-        embed.add_field(name="Nächster Schritt", value="Ein Teammitglied meldet sich gleich für die Zahlungsabwicklung.", inline=False)
-
-        self.disabled = True
-        await interaction.response.edit_message(view=self.view)
-        await interaction.followup.send(embed=embed)
-
-
-class FamSelectView(discord.ui.View):
-    def __init__(self, product_key: str):
-        super().__init__(timeout=None)
-        self.add_item(FamSelect(product_key))
-
-
-STATUS_CATEGORIES = {
-    "in_bearbeitung": "🟠 IN BEARBEITUNG",
-    "pause": "🟡 PAUSE",
-    "fertig": "🟢 FERTIG",
-}
-STATUS_PREFIX = {
-    "in_bearbeitung": "🟠",
-    "pause": "🟡",
-    "fertig": "🟢",
-}
-
-
-async def set_ticket_status(channel: discord.TextChannel, status: str):
-    guild = channel.guild
-    category_name = STATUS_CATEGORIES[status]
-    category = discord.utils.get(guild.categories, name=category_name) or await guild.create_category(category_name)
-    await channel.edit(category=category, sync_permissions=True)
-
-    # bisheriges Status-Emoji am Anfang des Namens entfernen, neues voranstellen
-    base_name = channel.name
-    for emoji in STATUS_PREFIX.values():
-        if base_name.startswith(emoji + "-") or base_name.startswith(emoji):
-            base_name = base_name.lstrip(emoji).lstrip("-")
-    new_name = f"{STATUS_PREFIX[status]}-{base_name}"[:90]
-    await channel.edit(name=new_name)
-
-
-class StatusView(discord.ui.View):
+class VoltTickets(commands.Bot):
     def __init__(self):
-        super().__init__(timeout=None)
+        super().__init__(command_prefix="!ticket-", intents=intents)
 
-    @discord.ui.button(label="In Bearbeitung", style=discord.ButtonStyle.secondary, emoji="🟠", custom_id="status_bearbeitung")
-    async def bearbeitung(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await set_ticket_status(interaction.channel, "in_bearbeitung")
-        await interaction.response.send_message("🟠 Status: In Bearbeitung", ephemeral=False)
-
-    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="🟡", custom_id="status_pause")
-    async def pause(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await set_ticket_status(interaction.channel, "pause")
-        await interaction.response.send_message("🟡 Status: Pause", ephemeral=False)
-
-    @discord.ui.button(label="Fertig", style=discord.ButtonStyle.success, emoji="🟢", custom_id="status_fertig")
-    async def fertig(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await set_ticket_status(interaction.channel, "fertig")
-        await interaction.response.send_message("🟢 Status: Fertig", ephemeral=False)
-
-
-class RatingView(discord.ui.View):
-    """Sterne-Bewertung, die der Kunde vor dem Schließen abgeben kann."""
-
-    def __init__(self, requester_id: int):
-        super().__init__(timeout=120)
-        self.requester_id = requester_id
-        self.rating: int | None = None
-        self.message: discord.Message | None = None
-
-    async def _handle(self, interaction: discord.Interaction, stars: int):
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("❌ Nur der Ticket-Ersteller kann bewerten.", ephemeral=True)
-            return
-        self.rating = stars
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(content=f"Danke für deine Bewertung: {'⭐' * stars}", view=self)
-        self.stop()
-
-    @discord.ui.button(label="1", emoji="⭐", style=discord.ButtonStyle.secondary)
-    async def r1(self, interaction, button):
-        await self._handle(interaction, 1)
-
-    @discord.ui.button(label="2", emoji="⭐", style=discord.ButtonStyle.secondary)
-    async def r2(self, interaction, button):
-        await self._handle(interaction, 2)
-
-    @discord.ui.button(label="3", emoji="⭐", style=discord.ButtonStyle.secondary)
-    async def r3(self, interaction, button):
-        await self._handle(interaction, 3)
-
-    @discord.ui.button(label="4", emoji="⭐", style=discord.ButtonStyle.secondary)
-    async def r4(self, interaction, button):
-        await self._handle(interaction, 4)
-
-    @discord.ui.button(label="5", emoji="⭐", style=discord.ButtonStyle.success)
-    async def r5(self, interaction, button):
-        await self._handle(interaction, 5)
-
-
-class CloseTicketView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Ticket schließen", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="close_ticket")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        channel = interaction.channel
-        member = interaction.user
-
-        support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
-        is_support = support_role in member.roles if support_role else False
-        is_owner_of_ticket = channel.topic and str(member.id) in channel.topic
-
-        if not (is_support or is_owner_of_ticket or member.guild_permissions.administrator):
-            await interaction.response.send_message("❌ Nur Support oder der Ersteller können dieses Ticket schließen.", ephemeral=True)
-            return
-
-        await interaction.response.send_message("🔒 Ticket wird in 60 Sekunden archiviert. Bitte kurz bewerten:", ephemeral=False)
-
-        # Bewertung abfragen, bevor das Ticket wirklich geschlossen wird
-        rating = None
-        requester_id = None
-        if channel.topic and "|" in channel.topic:
-            try:
-                requester_id = int(channel.topic.split("Ticket für ")[1].split(" |")[0])
-            except (IndexError, ValueError):
-                requester_id = None
-
-        if requester_id:
-            rating_view = RatingView(requester_id)
-            rating_msg = await channel.send(
-                f"<@{requester_id}> Wie zufrieden warst du mit diesem Ticket?", view=rating_view
-            )
-            await rating_view.wait()
-            rating = rating_view.rating
-
-            if rating:
-                reviews_channel = discord.utils.get(guild.text_channels, name="⭐・bewertungen") or discord.utils.get(guild.text_channels, name="bewertungen")
-                if reviews_channel:
-                    review_embed = discord.Embed(
-                        title="Neue Kundenbewertung",
-                        description=f"{'⭐' * rating}{'☆' * (5 - rating)}  ({rating}/5)",
-                        color=discord.Color.from_str("#E30613"),
-                    )
-                    review_embed.add_field(name="Ticket", value=channel.name, inline=True)
-                    review_embed.add_field(name="Kunde", value=f"<@{requester_id}>", inline=True)
-                    await reviews_channel.send(embed=review_embed)
-
-        # Transcript zusammenbauen
-        lines = []
-        async for msg in channel.history(limit=None, oldest_first=True):
-            lines.append(f"[{msg.created_at:%Y-%m-%d %H:%M}] {msg.author}: {msg.content}")
-        transcript = "\n".join(lines) or "(keine Nachrichten)"
-
-        log_channel = discord.utils.get(guild.text_channels, name="ticket-logs")
-        if log_channel:
-            import io
-            file = discord.File(io.BytesIO(transcript.encode("utf-8")), filename=f"{channel.name}.txt")
-            await log_channel.send(content=f"📁 Transcript von {channel.name} (geschlossen von {member})", file=file)
-
-        await channel.delete(reason=f"Ticket geschlossen von {member}")
-
-
-class ProductButton(discord.ui.Button):
-    def __init__(self, key: str, product: dict):
-        super().__init__(
-            label=f"{product['name']} – ab {product['klein']}€",
-            emoji=product["emoji"],
-            style=discord.ButtonStyle.primary,
-            custom_id=f"order_product:{key}",
-        )
-        self.product_key = key
-
-    async def callback(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        user = interaction.user
-
-        tickets_category = await get_or_create_category(guild, "🎫 TICKETS")
-        support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
-        }
-        if support_role:
-            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-        channel_name = f"ticket-{user.name}-{self.product_key}"[:90]
-        ticket_channel = await guild.create_text_channel(
-            channel_name,
-            category=tickets_category,
-            overwrites=overwrites,
-            topic=f"Ticket für {user.id} | Produkt: {self.product_key}",
-        )
-
-        await interaction.response.send_message(f"✅ Dein Ticket wurde erstellt: {ticket_channel.mention}", ephemeral=True)
-
-        await ticket_channel.send(
-            content=f"{user.mention} willkommen! Bitte wähle unten deine Fam-Größe.",
-            embed=product_embed(self.product_key),
-            view=FamSelectView(self.product_key),
-        )
-        await ticket_channel.send("Status ändern:", view=StatusView())
-        await ticket_channel.send(view=CloseTicketView())
-        await set_ticket_status(ticket_channel, "in_bearbeitung")
-
-
-class ProductMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        for key, product in PRODUCTS.items():
-            self.add_item(ProductButton(key, product))
-
-
-class TicketBot(commands.Bot):
     async def setup_hook(self):
-        self.add_view(ProductMenuView())
-        self.add_view(CloseTicketView())
-        self.add_view(StatusView())
+        self.add_view(OrderPanelView())  # persistent (überlebt Restarts)
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild_obj)
@@ -324,54 +71,246 @@ class TicketBot(commands.Bot):
             await self.tree.sync()
 
 
-bot = TicketBot(command_prefix="!ticket-", intents=intents)
+bot = VoltTickets()
+
+
+# --------------------------------------------------------------------------
+# Helfer: Berechtigungen & Kategorien
+# --------------------------------------------------------------------------
+
+def staff_roles(guild: discord.Guild) -> list[discord.Role]:
+    roles = []
+    for name in STAFF_ROLE_NAMES:
+        role = discord.utils.get(guild.roles, name=name)
+        if role:
+            roles.append(role)
+    return roles
+
+
+def build_ticket_overwrites(guild: discord.Guild, creator: discord.Member, *, can_write: bool = True):
+    """Baut die Overwrites, die IMMER (bei Erstellung UND jedem Status-Wechsel)
+    explizit gesetzt werden - niemals über sync_permissions."""
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        creator: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=can_write,
+            read_message_history=True,
+            attach_files=True,
+        ),
+    }
+    for role in staff_roles(guild):
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=True,
+        )
+    return overwrites
+
+
+async def ensure_category(guild: discord.Guild, name: str) -> discord.CategoryChannel:
+    cat = discord.utils.get(guild.categories, name=name)
+    if cat is None:
+        # Kategorie selbst bleibt privat per Default - einzelne Ticket-Kanäle
+        # bekommen trotzdem IMMER ihre eigenen Overwrites (s.u.), damit nie
+        # versehentlich über die Kategorie synchronisiert wird.
+        cat = await guild.create_category(name)
+    return cat
+
+
+async def set_ticket_status(channel: discord.TextChannel, status: str, creator: discord.Member):
+    """status: 'open' | 'closed'. Setzt IMMER explizite Overwrites, nie sync_permissions."""
+    guild = channel.guild
+    if status == "open":
+        category = await ensure_category(guild, TICKETS_OPEN_CATEGORY)
+        overwrites = build_ticket_overwrites(guild, creator, can_write=True)
+    elif status == "closed":
+        category = await ensure_category(guild, TICKETS_CLOSED_CATEGORY)
+        overwrites = build_ticket_overwrites(guild, creator, can_write=False)
+    else:
+        raise ValueError("Unbekannter Status: " + status)
+
+    # sync_permissions bewusst NICHT gesetzt (Default: False) -> die Kategorie
+    # kann die hier gesetzten Overwrites nicht überschreiben.
+    await channel.edit(category=category, overwrites=overwrites, reason=f"Ticket-Status: {status}")
+
+
+# --------------------------------------------------------------------------
+# UI: Bestell-Panel (2-stufiges Dropdown) + Ticket-Ansicht
+# --------------------------------------------------------------------------
+
+class ProductSelect(discord.ui.Select):
+    def __init__(self, category_key: str):
+        category = CATEGORIES[category_key]
+        options = [
+            discord.SelectOption(
+                label=data["name"],
+                value=key,
+                emoji=data.get("emoji"),
+                description=f'{format_price(data["klein"])} / {format_price(data["big"])}',
+            )
+            for key, data in category["products"].items()
+        ]
+        super().__init__(placeholder="2️⃣ Produkt auswählen...", options=options, custom_id=f"product_select:{category_key}")
+        self.category_key = category_key
+
+    async def callback(self, interaction: discord.Interaction):
+        product_key = self.values[0]
+        await create_ticket(interaction, self.category_key, product_key)
+
+
+class ProductSelectView(discord.ui.View):
+    def __init__(self, category_key: str):
+        super().__init__(timeout=180)
+        self.add_item(ProductSelect(category_key))
+
+
+class CategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=data["label"], value=key, emoji=data.get("emoji"), description=data["beschreibung"][:100])
+            for key, data in CATEGORIES.items()
+        ]
+        super().__init__(placeholder="1️⃣ Kategorie auswählen...", options=options, custom_id="order_category_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        category_key = self.values[0]
+        await interaction.response.send_message(
+            f"Alles klar - wähle jetzt ein Produkt aus **{CATEGORIES[category_key]['label']}**:",
+            view=ProductSelectView(category_key),
+            ephemeral=True,
+        )
+
+
+class OrderPanelView(discord.ui.View):
+    """Persistent View - läuft nicht ab, überlebt Bot-Neustarts (custom_id fest)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(CategorySelect())
+
+
+class TicketControlView(discord.ui.View):
+    """Buttons im Ticket-Kanal selbst: Schließen / Wieder öffnen."""
+
+    def __init__(self, creator_id: int):
+        super().__init__(timeout=None)
+        self.creator_id = creator_id
+
+    @discord.ui.button(label="Ticket schließen", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (interaction.user.id == self.creator_id or any(r.name in STAFF_ROLE_NAMES for r in interaction.user.roles)):
+            return await interaction.response.send_message("❌ Das darfst nur der Ersteller oder das Team.", ephemeral=True)
+        creator = interaction.guild.get_member(self.creator_id)
+        await set_ticket_status(interaction.channel, "closed", creator)
+        await interaction.response.send_message("🔒 Ticket geschlossen. Nur noch das Team kann hier schreiben.", view=None)
+
+    @discord.ui.button(label="Wieder öffnen", style=discord.ButtonStyle.success, custom_id="ticket_reopen", emoji="🔓")
+    async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not any(r.name in STAFF_ROLE_NAMES for r in interaction.user.roles):
+            return await interaction.response.send_message("❌ Nur das Team kann Tickets wieder öffnen.", ephemeral=True)
+        creator = interaction.guild.get_member(self.creator_id)
+        await set_ticket_status(interaction.channel, "open", creator)
+        await interaction.response.send_message("🔓 Ticket wieder geöffnet.", view=None)
+
+
+async def create_ticket(interaction: discord.Interaction, category_key: str, product_key: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    creator = interaction.user
+    category_data = CATEGORIES[category_key]
+    product = category_data["products"][product_key]
+
+    existing = discord.utils.get(guild.text_channels, name=f"ticket-{creator.name}".lower()[:90])
+    if existing:
+        return await interaction.followup.send(f"Du hast bereits ein offenes Ticket: {existing.mention}", ephemeral=True)
+
+    ticket_category = await ensure_category(guild, TICKETS_OPEN_CATEGORY)
+    overwrites = build_ticket_overwrites(guild, creator, can_write=True)
+
+    channel = await guild.create_text_channel(
+        name=f"ticket-{creator.name}"[:90],
+        category=ticket_category,
+        overwrites=overwrites,
+        reason=f"Neues Bestell-Ticket von {creator}",
+        topic=f"Ticket von {creator.id} | Kategorie: {category_key} | Produkt: {product_key}",
+    )
+
+    embed = discord.Embed(
+        title=f"{product.get('emoji', '🛒')} Neue Bestellung: {product['name']}",
+        description=product.get("beschreibung", ""),
+        color=VOLT_RED,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Kategorie", value=category_data["label"], inline=True)
+    embed.add_field(name="Preis (klein)", value=format_price(product["klein"]), inline=True)
+    embed.add_field(name="Preis (groß)", value=format_price(product["big"]), inline=True)
+    embed.add_field(name="Bedingungen", value=TERMS, inline=False)
+    embed.set_thumbnail(url=f"attachment://{os.path.basename(branding.ICON)}")
+    embed.set_footer(text=f"Erstellt von {creator} • {branding.TICKETS_FOOTER}", icon_url=creator.display_avatar.url)
+
+    mentions = " ".join(r.mention for r in staff_roles(guild)) or ""
+    await channel.send(
+        content=f"{creator.mention} {mentions}".strip(),
+        embed=embed,
+        file=branding.banner_file(branding.ICON),
+        view=TicketControlView(creator.id),
+        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+    )
+
+    log_channel = discord.utils.get(guild.text_channels, name=TICKET_LOG_CHANNEL)
+    if log_channel:
+        await log_channel.send(f"🎫 Neues Ticket {channel.mention} von {creator.mention} ({category_data['label']} → {product['name']})")
+
+    await interaction.followup.send(f"✅ Dein Ticket wurde erstellt: {channel.mention}", ephemeral=True)
+
+
+# --------------------------------------------------------------------------
+# Slash-Commands
+# --------------------------------------------------------------------------
+
+@bot.tree.command(name="setup-tickets", description="[Admin] Postet das Bestell-Panel in diesen Kanal")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_tickets(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="⚡ VOLT TICKETS - Bestellung starten",
+        description=(
+            "Wähle unten zuerst deine **Kategorie**, danach das gewünschte **Produkt**.\n"
+            "Es wird automatisch ein privates Ticket für dich erstellt - "
+            "nur du und unser Team können es sehen."
+        ),
+        color=VOLT_RED,
+    )
+    for data in CATEGORIES.values():
+        embed.add_field(name=f"{data.get('emoji', '')} {data['label']}", value=data["beschreibung"], inline=False)
+    embed, file = branding.with_tickets_banner(embed)
+    await interaction.channel.send(embed=embed, file=file, view=OrderPanelView())
+    await interaction.response.send_message("✅ Bestell-Panel gepostet.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket-add", description="[Team] Fügt eine Person zu diesem Ticket hinzu")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_add(interaction: discord.Interaction, member: discord.Member):
+    await interaction.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+    await interaction.response.send_message(f"➕ {member.mention} wurde zum Ticket hinzugefügt.")
+
+
+@bot.tree.command(name="ticket-remove", description="[Team] Entfernt eine Person aus diesem Ticket")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_remove(interaction: discord.Interaction, member: discord.Member):
+    await interaction.channel.set_permissions(member, overwrite=None)
+    await interaction.response.send_message(f"➖ {member.mention} wurde aus dem Ticket entfernt.")
 
 
 @bot.event
 async def on_ready():
-    log.info("Ticket-Bot eingeloggt als %s", bot.user)
-
-
-@bot.tree.command(name="setup-tickets", description="[Admin] Postet das Bestell-Menü in diesen Kanal")
-@is_admin()
-async def setup_tickets(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🛒 Bestellung",
-        description="Wähle unten das gewünschte Produkt aus, um ein Ticket zu eröffnen.",
-        color=discord.Color.blurple(),
-    )
-    await interaction.channel.send(embed=embed, view=ProductMenuView())
-    await interaction.response.send_message("✅ Bestell-Menü wurde gepostet.", ephemeral=True)
-
-
-@bot.tree.command(name="post-preisliste", description="[Admin] Postet die vollständige Preisliste in diesen Kanal")
-@is_admin()
-async def post_preisliste(interaction: discord.Interaction):
-    accent = discord.Color.from_str("#E30613")
-    intro = discord.Embed(
-        title="💰 VOLT – Preisliste",
-        description="Übersicht aller Leistungen. Preise gelten pro Fam-Größe, siehe Angaben.",
-        color=accent,
-    )
-    await interaction.channel.send(embed=intro)
-    for key in PRODUCTS:
-        await interaction.channel.send(embed=product_embed(key))
-    await interaction.response.send_message("✅ Preisliste gepostet.", ephemeral=True)
-
-
-@setup_tickets.error
-async def on_ticket_command_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Dieser Command ist nur für Administratoren.", ephemeral=True)
-    else:
-        log.exception("Fehler in Ticket-Command", exc_info=error)
-        if interaction.response.is_done():
-            await interaction.followup.send("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ Es ist ein Fehler aufgetreten.", ephemeral=True)
+    log.info("VOLT TICKETS eingeloggt als %s", bot.user)
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Tickets. Orders. Done right. ⚡"))
 
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN fehlt in der .env Datei!")
+        raise SystemExit("DISCORD_TOKEN / TICKET_DISCORD_TOKEN fehlt in der .env Datei!")
     bot.run(TOKEN)
