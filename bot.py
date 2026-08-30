@@ -25,6 +25,17 @@ verwendet. Die Sichtbarkeit ist dadurch bei jedem Schritt garantiert:
     @everyone         -> kein Zugriff
     Ticket-Ersteller   -> sehen + schreiben (read_message_history immer erlaubt)
     Staff-Rollen       -> sehen + schreiben + verwalten
+
+WEITERER FIX (siehe /setup-tickets):
+-------------------------------------------
+Interaction-Commands müssen Discord innerhalb von 3 Sekunden bestätigen
+(defer oder send_message), sonst zeigt Discord "Die Anwendung reagiert
+nicht". `/setup-tickets` hat vorher erst das Panel gepostet (Datei-Upload)
+und DANACH erst geantwortet - bei Verzögerung (Cold Start, Netzwerk) war
+die Interaction dann schon abgelaufen. Jetzt wird zuerst `defer()`t und erst
+danach gearbeitet, genau wie es `create_ticket()` in dieser Datei schon
+immer richtig gemacht hat. Zusätzlich gibt es jetzt einen globalen
+Error-Handler, der echte Fehler sichtbar macht statt sie zu verschlucken.
 """
 
 import os
@@ -274,6 +285,10 @@ async def create_ticket(interaction: discord.Interaction, category_key: str, pro
 @bot.tree.command(name="setup-tickets", description="[Admin] Postet das Bestell-Panel in diesen Kanal")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup_tickets(interaction: discord.Interaction):
+    # WICHTIG: zuerst deferren, dann erst den (potenziell langsamen) Datei-Upload
+    # machen - sonst läuft die Interaction ab -> "Die Anwendung reagiert nicht".
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     embed = discord.Embed(
         title="⚡ VOLT TICKETS - Bestellung starten",
         description=(
@@ -287,7 +302,7 @@ async def setup_tickets(interaction: discord.Interaction):
         embed.add_field(name=f"{data.get('emoji', '')} {data['label']}", value=data["beschreibung"], inline=False)
     embed, file = branding.with_tickets_banner(embed)
     await interaction.channel.send(embed=embed, file=file, view=OrderPanelView())
-    await interaction.response.send_message("✅ Bestell-Panel gepostet.", ephemeral=True)
+    await interaction.followup.send("✅ Bestell-Panel gepostet.", ephemeral=True)
 
 
 @bot.tree.command(name="ticket-add", description="[Team] Fügt eine Person zu diesem Ticket hinzu")
@@ -302,6 +317,31 @@ async def ticket_add(interaction: discord.Interaction, member: discord.Member):
 async def ticket_remove(interaction: discord.Interaction, member: discord.Member):
     await interaction.channel.set_permissions(member, overwrite=None)
     await interaction.response.send_message(f"➖ {member.mention} wurde aus dem Ticket entfernt.")
+
+
+# -------------------------------------------------------- globaler Error-Handler
+# Vorher gab es HIER GAR KEINEN Handler - Fehler (z.B. abgelaufene Interaction,
+# fehlende Berechtigung, fehlende Datei) wurden einfach verschluckt und man
+# sah nur Discords generisches "Die Anwendung reagiert nicht" / gar nichts.
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "❌ Dir fehlt die nötige Berechtigung für diesen Befehl."
+    else:
+        log.exception("Fehler in Ticket-Command", exc_info=error)
+        original = getattr(error, "original", error)
+        short_error = f"{type(original).__name__}: {original}"[:1500]
+        msg = f"❌ Es ist ein Fehler aufgetreten:\n```\n{short_error}\n```"
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        # Interaction ist bereits abgelaufen -> wenigstens ins Log schreiben
+        log.warning("Konnte Fehlermeldung nicht mehr an Discord senden (Interaction abgelaufen).")
 
 
 @bot.event
